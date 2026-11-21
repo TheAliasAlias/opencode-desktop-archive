@@ -1,0 +1,498 @@
+--- /dev/null
++++ b/packages/app/src/session/commands/archive-session.ts
+@@ -0,0 +1,50 @@
++import type { SessionInfo } from "@opencode/client/promise"
++import { useQueryClient } from "@tanstack/solid-query"
++import { useLanguage } from "@/runtime/i18n/language"
++import { ServerConnection } from "@/runtime/server/registry"
++import { useGlobal } from "@/runtime/server/runtime"
++import { notifySessionTabsRemoved } from "@/shell/titlebar/session-events"
++
++export const ARCHIVED_SESSIONS_QUERY_KEY = "archived-sessions"
++
++/** Archives or restores a session and refreshes every list that shows it. */
++export function createSessionArchiver() {
++  const global = useGlobal()
++
++  const language = useLanguage()
++
++  const queryClient = useQueryClient()
++
++  return async (server: ServerConnection.Key, session: SessionInfo, archived: boolean) => {
++    const ctx = global.serverCtx(server)
++
++    if (!ctx) throw new Error(language.t("common.requestFailed"))
++    await ctx.sdk.api.session.update({ sessionID: session.id, archived })
++
++    const current = ctx.data.session.get(session.id)
++
++    if (current)
++      ctx.data.session.remember({
++        ...current,
++        time: { ...current.time, archived: archived ? (current.time.archived ?? Date.now()) : undefined },
++      })
++
++    // Archiving removes the session's tabs for good, so reopening the tab stack cannot bring it back.
++    if (archived)
++      notifySessionTabsRemoved({
++        server,
++        directory: session.location.directory,
++        sessionIDs: [session.id],
++      })
++
++    await Promise.all(
++      [
++        [ARCHIVED_SESSIONS_QUERY_KEY],
++        ["home-sessions"],
++        ["project-sessions"],
++        ["inbox-sessions"],
++        ["inbox-archived-sessions"],
++      ].map((queryKey) => queryClient.invalidateQueries({ queryKey })),
++    )
++  }
++}
+--- /dev/null
++++ b/packages/app/src/shell/titlebar/archive-sessions.tsx
+@@ -0,0 +1,163 @@
++import type { SessionInfo } from "@opencode/client/promise"
++import { useQueries, useQueryClient } from "@tanstack/solid-query"
++import { Schema } from "effect"
++import { createEffect, createMemo, For, onCleanup, Show } from "solid-js"
++import { Icon } from "@opencode/ui/icon"
++import { useLanguage } from "@/runtime/i18n/language"
++import { Persistence } from "@/runtime/persistence/schema"
++import { Persist, persisted } from "@/runtime/persistence/storage"
++import { ServerConnection, useServers } from "@/runtime/server/registry"
++import { useGlobal, type ServerCtx } from "@/runtime/server/runtime"
++import { useTabs } from "@/shell/tabs/tabs"
++import { ARCHIVED_SESSIONS_QUERY_KEY } from "@/session/commands/archive-session"
++import { ProjectSessionRow } from "./project-session-row"
++
++const ARCHIVED_SESSION_LIMIT = 50
++
++const ArchiveSidebarState = Persistence.struct({
++  expanded: Schema.Boolean,
++})
++
++// Keep the immutable result opaque so Solid Query does not recursively unwrap every session.
++const selectSessions = (sessions: SessionInfo[]) => () => sessions
++
++type ArchivedEntry = {
++  key: string
++  conn: ServerConnection.Any
++  server: ServerConnection.Key
++  ctx: ServerCtx
++  session: SessionInfo
++}
++
++/**
++ * The collapsible Archive fold shared by the vertical sidebars. It lists the newest archived root sessions on every
++ * visible server and keeps the rows live as sessions are archived, restored or deleted.
++ */
++export function ArchiveSessions() {
++  const language = useLanguage()
++
++  const global = useGlobal()
++
++  const servers = useServers()
++
++  const tabs = useTabs()
++
++  const queryClient = useQueryClient()
++
++  const [state, setState] = persisted(Persist.global("sidebar.archive"), ArchiveSidebarState, { expanded: false })
++
++  const connections = createMemo(() =>
++    servers.visible.flatMap((conn) => {
++      const server = ServerConnection.key(conn)
++      const ctx = global.serverCtx(server)
++
++      return ctx ? [{ conn, server, ctx }] : []
++    }),
++  )
++
++  const queries = useQueries(() => ({
++    queries: connections().map((item) => ({
++      queryKey: [ARCHIVED_SESSIONS_QUERY_KEY, item.conn] as const,
++      enabled: item.ctx.sdk.connection.status() === "connected",
++      queryFn: ({ signal }: { signal: AbortSignal }) =>
++        item.ctx.sdk.api.session
++          .list({ limit: ARCHIVED_SESSION_LIMIT, order: "desc", parentID: null, archived: true }, { signal })
++          .then((response) => response.data),
++      retry: false,
++      staleTime: 30_000,
++      refetchOnMount: true,
++      refetchOnReconnect: true,
++      select: selectSessions,
++    })),
++  }))
++
++  // Archive changes can come from another window, the inbox, or a search dialog. Refresh the fold as they land.
++  createEffect(() => {
++    connections().forEach((item) => {
++      const refresh = () =>
++        void queryClient.invalidateQueries({ queryKey: [ARCHIVED_SESSIONS_QUERY_KEY, item.conn], exact: true })
++
++      onCleanup(item.ctx.data.on("session.archived", refresh))
++      onCleanup(item.ctx.data.on("session.unarchived", refresh))
++      onCleanup(item.ctx.data.on("session.deleted", refresh))
++    })
++  })
++
++  const entries = createMemo(() => {
++    const seen = new Set<string>()
++
++    return connections()
++      .flatMap((item, index): ArchivedEntry[] =>
++        (queries[index]?.data?.() ?? []).flatMap((session) => {
++          const key = `${item.server}\0${session.id}`
++
++          if (seen.has(key) || session.time.archived === undefined) return []
++          seen.add(key)
++
++          return [{ key, conn: item.conn, server: item.server, ctx: item.ctx, session }]
++        }),
++      )
++      .toSorted(
++        (a, b) =>
++          (b.session.time.updated ?? b.session.time.created) - (a.session.time.updated ?? a.session.time.created),
++      )
++  })
++
++  const open = (entry: ArchivedEntry) => {
++    void entry.ctx.projects.touch(entry.session.location.directory)
++    void entry.ctx.data.session.message.sync(entry.session.id).catch(() => undefined)
++    tabs.select(tabs.addSessionTab({ server: entry.server, sessionId: entry.session.id }))
++  }
++
++  return (
++    <section data-slot="sidebar-archive" class="flex w-full shrink-0 flex-col gap-1 pt-1">
++      <button
++        type="button"
++        data-action="sidebar-archive-toggle"
++        class="group/archive flex h-7 min-w-0 w-full shrink-0 items-center rounded-[6px] pe-1 hover:bg-v2-overlay-simple-overlay-hover focus-visible:bg-v2-overlay-simple-overlay-hover"
++        aria-expanded={state.expanded}
++        onClick={() => setState("expanded", !state.expanded)}
++      >
++        <span class="flex h-full min-w-0 flex-1 items-center gap-1.5 rounded-[6px] px-2 text-start text-[13px] leading-[var(--line-height-compact)] text-v2-text-text-muted group-hover/archive:text-v2-text-text-base focus-visible:text-v2-text-text-base focus-visible:outline-none">
++          <Icon name="archive" class="size-4 shrink-0 text-v2-icon-icon-muted" />
++          <span class="min-w-0 flex-1 truncate">{language.t("common.archive")}</span>
++          <Show when={entries().length > 0}>
++            <span class="shrink-0 text-[11px] leading-[var(--line-height-compact)] text-v2-text-text-faint [font-weight:400]">
++              {entries().length}
++            </span>
++          </Show>
++          <Icon
++            name="fill-triangle-down"
++            class="shrink-0 text-v2-icon-icon-muted transition-transform motion-reduce:transition-none"
++            classList={{ "-rotate-90 rtl:rotate-90": !state.expanded }}
++          />
++        </span>
++      </button>
++      <Show when={state.expanded}>
++        <div data-slot="sidebar-archive-list" class="flex min-w-0 flex-col gap-[3px]">
++          <Show
++            when={entries().length > 0}
++            fallback={
++              <div class="ps-8 pe-2 py-2 text-12-regular text-v2-text-text-faint">
++                {language.t("sidebar.organize.empty")}
++              </div>
++            }
++          >
++            <For each={entries()}>
++              {(entry) => (
++                <ProjectSessionRow
++                  server={entry.server}
++                  session={entry.session}
++                  openTab={false}
++                  active={false}
++                  label={connections().length > 1 ? servers.label(entry.conn) : undefined}
++                  onOpen={() => open(entry)}
++                />
++              )}
++            </For>
++          </Show>
++        </div>
++      </Show>
++    </section>
++  )
++}
+--- a/packages/app/src/home/sessions/controller.tsx
++++ b/packages/app/src/home/sessions/controller.tsx
+@@ -26,6 +26,7 @@
+ import { sessionTreeIDs } from "@/session/requests/session-request-tree"
+ import { pathKey } from "@/workspaces/path-key"
+ import { createSessionExporter } from "@/session/commands/export-session"
++import { createSessionArchiver } from "@/session/commands/archive-session"
+ import {
+   createSessionDeleteState,
+   selectSessionDeleteView,
+@@ -37,7 +38,6 @@
+ import { usePlatform } from "@/runtime/platform/platform"
+ import { sessionLabel, sessionTitle } from "@/session/title"
+ import { showToast } from "@/shell/notifications/toast"
+-import { archiveHomeSession } from "./archive"
+ import { homeSessionsQuery, lookupHomeSession, projectSessionDirectories, projectSessionsQuery } from "./queries"
+ import {
+   HOME_SESSIONS_STALE_MS,
+@@ -374,6 +374,8 @@
+ 
+   const exporter = createSessionExporter()
+ 
++  const archiver = createSessionArchiver()
++
+   const serverContext = (server: ServerConnection.Key) => {
+     const conn = home.server.list().find((item) => ServerConnection.key(item) === server)
+     const ctx = conn ? home.server.context(conn) : undefined
+@@ -549,21 +551,14 @@
+       },
+       archive: async (session: SessionInfo) => {
+         const conn = home.server.focused()
+-        const ctx = home.server.focusedContext()
+ 
+-        if (!conn || !ctx) return
+-        await archiveHomeSession({
+-          server: ServerConnection.key(conn),
+-          session,
+-          // TODO: Restore archiving when the V2 client exposes a session archive API.
+-          archive: async (_sessionID) => Promise.reject(new Error("Session archiving is unavailable")),
+-          remove() {},
+-          onError: (cause) =>
+-            showToast({
+-              title: language.t("common.requestFailed"),
+-              description: errorMessage(cause, language.t("common.requestFailed")),
+-            }),
+-        })
++        if (!conn) return
++        await archiver(ServerConnection.key(conn), session, true).catch((cause) =>
++          showToast({
++            title: language.t("common.requestFailed"),
++            description: errorMessage(cause, language.t("common.requestFailed")),
++          }),
++        )
+       },
+       rename,
+       export: (server: ServerConnection.Key, session: SessionInfo) =>
+--- a/packages/app/src/home/sessions/view.tsx
++++ b/packages/app/src/home/sessions/view.tsx
+@@ -869,6 +869,9 @@
+               {props.language.t("common.export")}…
+             </Menu.Item>
+             <SessionReadMenuItem server={props.server} session={props.record.session} />
++            <Menu.Item onSelect={() => void props.onArchiveSession(props.record.session)}>
++              {props.language.t("common.archive")}
++            </Menu.Item>
+             <Menu.Separator />
+             <Menu.Item onSelect={() => props.onDeleteSession(props.server, props.record.session)}>
+               {props.language.t("common.delete")}…
+--- a/packages/app/src/shell/titlebar/inbox.tsx
++++ b/packages/app/src/shell/titlebar/inbox.tsx
+@@ -34,6 +34,7 @@
+ import { SessionReadMenuItem } from "@/session/session-read-menu-item"
+ import { RenameDialog } from "./project-session-row"
+ import { createSessionInbox, inboxArchived, type InboxEntry, type InboxStatus } from "./inbox-model"
++import { ArchiveSessions } from "./archive-sessions"
+ import { compareWorking, workingSince } from "./inbox-working"
+ 
+ const RECENT_LIMIT = 10
+@@ -273,33 +274,38 @@
+   ]
+ 
+   return (
+-    <InboxSessionList
+-      loading={inbox.loading()}
+-      announcement={announcement.text}
+-      current={{
+-        get count() {
+-          return sections().current.length
+-        },
+-        rows: () => rows(() => sections().current),
+-      }}
+-      sections={groups}
+-      working={{
+-        get count() {
+-          return sections().working.length
+-        },
+-        rows: () => rows(() => sections().working),
+-        get expanded() {
+-          return state.workingExpanded
+-        },
+-        onToggle: () => setState("workingExpanded", !state.workingExpanded),
+-      }}
+-      archived={sections().archived}
+-      onArchived={async () => {
+-        const { DialogSessionSearch } = await import("@/shell/commands/session-search")
+-
+-        void dialog.show(() => <DialogSessionSearch archived />)
+-      }}
+-    />
++    <div class="flex min-h-0 flex-1 flex-col">
++      <InboxSessionList
++        loading={inbox.loading()}
++        announcement={announcement.text}
++        current={{
++          get count() {
++            return sections().current.length
++          },
++          rows: () => rows(() => sections().current),
++        }}
++        sections={groups}
++        working={{
++          get count() {
++            return sections().working.length
++          },
++          rows: () => rows(() => sections().working),
++          get expanded() {
++            return state.workingExpanded
++          },
++          onToggle: () => setState("workingExpanded", !state.workingExpanded),
++        }}
++        archived={sections().archived}
++        onArchived={async () => {
++          const { DialogSessionSearch } = await import("@/shell/commands/session-search")
++
++          void dialog.show(() => <DialogSessionSearch archived />)
++        }}
++      />
++      <div class="px-1.5 pb-1">
++        <ArchiveSessions />
++      </div>
++    </div>
+   )
+ }
+ 
+--- a/packages/app/src/shell/titlebar/project-session-row.tsx
++++ b/packages/app/src/shell/titlebar/project-session-row.tsx
+@@ -18,6 +18,7 @@
+ import { sessionLabel } from "@/session/title"
+ import { createSessionExporter } from "@/session/commands/export-session"
+ import { createSessionRenamer } from "@/session/commands/rename-session"
++import { createSessionArchiver } from "@/session/commands/archive-session"
+ import { SessionReadMenuItem } from "@/session/session-read-menu-item"
+ import { notifySessionTabsRemoved } from "./session-events"
+ import {
+@@ -65,6 +66,19 @@
+ 
+   const rename = createSessionRenamer()
+ 
++  const archive = createSessionArchiver()
++
++  const archived = () => props.session.time.archived !== undefined
++
++  const toggleArchive = () => {
++    void archive(props.server, props.session, !archived()).catch((cause) =>
++      showToast({
++        title: language.t("common.requestFailed"),
++        description: errorMessage(cause, language.t("common.requestFailed")),
++      }),
++    )
++  }
++
+   const exportTarget = () => ({ server: props.server, sessionID: props.session.id })
+ 
+   const status = useSessionTabAvatarState(
+@@ -172,10 +186,7 @@
+           <Show
+             when={status.loading()}
+             fallback={
+-              <Show
+-                when={!props.muted}
+-                fallback={<MutedIcon class="text-v2-icon-icon-faint" />}
+-              >
++              <Show when={!props.muted} fallback={<MutedIcon class="text-v2-icon-icon-faint" />}>
+                 <Show when={status.unread() && !props.active}>
+                   <span class="size-1.5 rounded-full bg-v2-text-text-base" />
+                 </Show>
+@@ -220,6 +231,9 @@
+             {language.t("common.export")}…
+           </Menu.Item>
+           <SessionReadMenuItem server={props.server} session={props.session} />
++          <Menu.Item disabled={!ctx()} onSelect={toggleArchive}>
++            {language.t(archived() ? "sidebar.inbox.unarchive" : "common.archive")}
++          </Menu.Item>
+           <Menu.Separator />
+           <Menu.Item disabled={!ctx()} onSelect={() => dialog.show(() => <DeleteDialog />)}>
+             {language.t("common.delete")}…
+--- a/packages/app/src/shell/titlebar/recent-sessions.tsx
++++ b/packages/app/src/shell/titlebar/recent-sessions.tsx
+@@ -55,6 +55,7 @@
+   type RecentSession,
+ } from "./recent-sessions-model"
+ import { notifySessionTabsRemoved } from "./session-events"
++import { ArchiveSessions } from "./archive-sessions"
+ import { TabNavItem } from "./tab-nav"
+ import { createSessionRowNavigation, syncInactiveSession } from "./tab-strip"
+ import { sessionTabTitle } from "./tab-title"
+@@ -898,6 +899,7 @@
+             </Button>
+           </div>
+         </Show>
++        <ArchiveSessions />
+       </div>
+     </div>
+   )
+--- a/packages/app/src/shell/titlebar/tab-nav.tsx
++++ b/packages/app/src/shell/titlebar/tab-nav.tsx
+@@ -14,7 +14,9 @@
+ import { SessionTabAvatarView } from "@/shell/layout/session-tab-avatar"
+ import type { SessionInfo } from "@opencode/client/promise"
+ import { showToast } from "@/shell/notifications/toast"
++import { errorMessage } from "@/shell/layout/helpers"
+ import { createSessionExporter } from "@/session/commands/export-session"
++import { createSessionArchiver } from "@/session/commands/archive-session"
+ import { SessionReadMenuItem } from "@/session/session-read-menu-item"
+ import { sessionTabTitle } from "./tab-title"
+ import { TabPreviewPopover } from "./tab-popover"
+@@ -118,6 +120,22 @@
+ 
+   const exporter = createSessionExporter()
+ 
++  const archive = createSessionArchiver()
++
++  const archived = () => props.session?.time.archived !== undefined
++
++  const toggleArchive = () => {
++    const session = props.session
++
++    if (!session) return
++    void archive(props.server, session, !archived()).catch((cause) =>
++      showToast({
++        title: language.t("common.requestFailed"),
++        description: errorMessage(cause, language.t("common.requestFailed")),
++      }),
++    )
++  }
++
+   // Shows the optimistic title, or the one to restore when its save fails.
+   const rememberTitle = (sessionID: string, title: string | undefined) => {
+     const ctx = serverCtx()
+@@ -668,6 +686,9 @@
+                 {language.t("common.export")}…
+               </Menu.Item>
+               <SessionReadMenuItem server={props.server} session={props.session} />
++              <Menu.Item disabled={!props.session} onSelect={toggleArchive}>
++                {language.t(archived() ? "sidebar.inbox.unarchive" : "common.archive")}
++              </Menu.Item>
+               <Menu.Separator />
+               <TabCloseMenuItems
+                 orientation={props.orientation}
+--- a/packages/app/src/shell/titlebar/tab-strip.tsx
++++ b/packages/app/src/shell/titlebar/tab-strip.tsx
+@@ -19,6 +19,7 @@
+ import { RestrictToHorizontalAxis, RestrictToVerticalAxis } from "@dnd-kit/abstract/modifiers"
+ import { RestrictToElement } from "@dnd-kit/dom/modifiers"
+ import { arrayMove } from "@/runtime/array-move"
++import { ArchiveSessions } from "./archive-sessions"
+ import { tabHref, tabKey, type SessionTab, type Tab } from "@/shell/tabs/tabs"
+ import { ServerConnection } from "@/runtime/server/registry"
+ import { DraftTabItem, TabNavItem, type TabCloseActions } from "@/shell/titlebar/tab-nav"
+@@ -971,6 +972,9 @@
+             </Show>
+           </div>
+         </DragDropProvider>
++        <Show when={vertical()}>
++          <ArchiveSessions />
++        </Show>
+       </div>
+       <Show when={!vertical()}>
+         <div

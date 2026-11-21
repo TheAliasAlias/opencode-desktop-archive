@@ -1,0 +1,3 @@
+# Unified diffs contain context lines that begin with a space.
+*.patch -whitespace
+*.png binary
